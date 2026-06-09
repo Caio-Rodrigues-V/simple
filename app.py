@@ -175,11 +175,15 @@ def fetch_list(list_id, list_name):
             f"?page={page}&include_closed=true&subtasks=false"
             f"&date_created_gt={DATE_FROM_TS}"
         )
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        if resp.status_code != 200:
-            print(f"[SYNC] Erro {resp.status_code} em {list_name}")
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=30)
+            if resp.status_code != 200:
+                print(f"[SYNC] Erro {resp.status_code} em {list_name}")
+                break
+            data  = resp.json()
+        except Exception as e:
+            print(f"[SYNC] Erro em {list_name} página {page}: {e}")
             break
-        data  = resp.json()
         batch = data.get("tasks", [])
         if not batch:
             break
@@ -188,7 +192,7 @@ def fetch_list(list_id, list_name):
         if data.get("last_page", True):
             break
         page += 1
-        time.sleep(0.2)
+        time.sleep(0.3)
     return tasks
 
 def get_all_deals(force=False):
