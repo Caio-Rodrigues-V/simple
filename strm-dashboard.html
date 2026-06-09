@@ -452,7 +452,7 @@ tr:hover td{background:rgba(139,92,246,0.04);}
 </div><!-- /main -->
 
 <script>
-const API = 'https://web-production-15ae0.up.railway.app/api';
+const API='http://127.0.0.1:5000/api';
 let statsData=null,dealsData=[],filteredDeals=[],lbMetric='signed';
 let pipelinePage=1;const PER=50;
 let charts={};
@@ -498,11 +498,19 @@ async function loadAll(){
     const[sRes,dRes]=await Promise.all([fetch(API+'/stats'+params),fetch(API+'/deals'+params)]);
     statsData=await sRes.json();
     const dd=await dRes.json();
+
+    if(statsData.loading||dd.loading){
+      document.getElementById('total-badge').textContent='Carregando...';
+      document.getElementById('kpi-grid').innerHTML='<div class="loading-wrap" style="grid-column:1/-1"><div class="spinner"></div><span>Buscando dados do ClickUp...</span></div>';
+      setTimeout(loadAll,5000);
+      return;
+    }
+
     dealsData=dd.deals||[];
     filteredDeals=dealsData;
     document.getElementById('total-badge').textContent=dealsData.length+' deals';
     renderSales();renderFunnel();renderPipeline();populateFilters();
-  }catch(e){console.error(e);}
+  }catch(e){console.error(e);setTimeout(loadAll,5000);}
 }
 
 async function syncData(){

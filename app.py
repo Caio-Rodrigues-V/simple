@@ -1,28 +1,18 @@
-from flask import Flask, jsonify, request, send_from_directory
-from flask_cors import CORS
-import requests
-from datetime import datetime, timezone
+import os
+import io
 import time
 import threading
-import io
+import requests
 import pandas as pd
+from datetime import datetime, timezone
+from flask import Flask, jsonify, request, send_from_directory
+from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-import os
 CLICKUP_TOKEN = os.environ.get("CLICKUP_TOKEN", "")
-
 HEADERS = {"Authorization": CLICKUP_TOKEN}
-
-LIST_IDS = {
-    "Unique Funnel":      "901324657489",
-    "Migration Funnel":   "901002241743",
-    "Activation Funnel":  "901317185660",
-    "Financial Funnel":   "901002241737",
-    "Completed Orders":   "901002241760",
-    "Not Now":            "901002241754",
-}
 
 LIST_PRIORITY = {
     "Unique Funnel":     0,
@@ -41,22 +31,22 @@ MEETING_STATUSES = {"realized meeting", "schedule meeting", "negotiation", "vali
                     "proposal presentation", "credit analysis", "waiting contract",
                     "legal form", "deliberation/committee"}
 
-DATE_FROM_TS = 1735689600000  # 01/01/2025
+DATE_FROM_TS = 1735689600000
 CAREER_STAGE_MAP = {0:1,1:2,2:3,3:4,4:5,5:6,6:7,7:8,8:9,9:10}
-
-_cache = {"data": None, "ts": 0}
-_growth_cache = {"data": None}
 CACHE_TTL = 300
 
-def get_field(custom_fields, field_id):
-    for f in custom_fields:
-        if f["id"] == field_id:
+_cache = {"data": None, "ts": 0, "loading": False}
+_growth_cache = {"data": None}
+
+def get_field(cf, fid):
+    for f in cf:
+        if f["id"] == fid:
             return f.get("value")
     return None
 
-def get_dropdown_name(custom_fields, field_id):
-    for f in custom_fields:
-        if f["id"] == field_id:
+def get_dropdown_name(cf, fid):
+    for f in cf:
+        if f["id"] == fid:
             val = f.get("value")
             if val is None:
                 return None
@@ -89,10 +79,9 @@ def transform_task(task, list_name):
 
     stage_raw    = get_field(cf, "a6b9b406-10f2-40ef-a087-c30c4f84d1ed")
     career_stage = CAREER_STAGE_MAP.get(stage_raw) if stage_raw is not None else None
-
-    executive = get_dropdown_name(cf, "32498777-fbec-4cd8-90dc-84682016fce3")
-    source    = get_dropdown_name(cf, "d31fe5b1-7ade-4e93-b00f-b0d1318a9870")
-    currency  = get_dropdown_name(cf, "131a2100-419c-433c-8eea-0c4255e4a34b") or "USD"
+    executive    = get_dropdown_name(cf, "32498777-fbec-4cd8-90dc-84682016fce3")
+    source       = get_dropdown_name(cf, "d31fe5b1-7ade-4e93-b00f-b0d1318a9870")
+    currency     = get_dropdown_name(cf, "131a2100-419c-433c-8eea-0c4255e4a34b") or "USD"
 
     advance_raw = get_field(cf, "25807731-2bf7-4d07-aa0d-6cb64c6f474b")
     try:
@@ -100,12 +89,11 @@ def transform_task(task, list_name):
     except:
         advance = None
 
-    country = get_field(cf, "ad90d5ff-539f-46d8-9e76-088399711f05")
-    region  = normalize_region(country)
-
-    created_at    = ms_to_date(task.get("date_created"))
-    closing_date  = ms_to_date(get_field(cf, "824950f2-67b0-4fca-a9e5-7e40d50dabef"))
-    new_lead_date = ms_to_date(get_field(cf, "cb73bc46-c08e-4f33-b2cf-c118b2a63683"))
+    country      = get_field(cf, "ad90d5ff-539f-46d8-9e76-088399711f05")
+    region       = normalize_region(country)
+    created_at   = ms_to_date(task.get("date_created"))
+    closing_date = ms_to_date(get_field(cf, "824950f2-67b0-4fca-a9e5-7e40d50dabef"))
+    new_lead_date= ms_to_date(get_field(cf, "cb73bc46-c08e-4f33-b2cf-c118b2a63683"))
 
     lead_time = None
     if closing_date and new_lead_date:
@@ -127,13 +115,9 @@ def transform_task(task, list_name):
     is_signed  = status in SIGNED_STATUSES
     is_sql     = status in SQL_STATUSES
     is_meeting = status in MEETING_STATUSES or meetings > 0
-
-    is_eligible = False
+    is_eligible= False
     if career_stage:
-        if region == "US":
-            is_eligible = career_stage >= 3
-        else:
-            is_eligible = career_stage >= 4
+        is_eligible = career_stage >= 3 if region == "US" else career_stage >= 4
     is_mql = is_eligible
 
     email_raw = get_field(cf, "1bf8f12f-0b09-45bc-9824-24198ad3e116")
@@ -176,13 +160,13 @@ def fetch_list(list_id, list_name):
             f"&date_created_gt={DATE_FROM_TS}"
         )
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=30)
+            resp = requests.get(url, headers=HEADERS, timeout=60)
             if resp.status_code != 200:
                 print(f"[SYNC] Erro {resp.status_code} em {list_name}")
                 break
-            data  = resp.json()
+            data = resp.json()
         except Exception as e:
-            print(f"[SYNC] Erro em {list_name} página {page}: {e}")
+            print(f"[SYNC] Erro em {list_name} pg {page}: {e}")
             break
         batch = data.get("tasks", [])
         if not batch:
@@ -195,19 +179,21 @@ def fetch_list(list_id, list_name):
         time.sleep(0.3)
     return tasks
 
-def get_all_deals(force=False):
+def _do_sync(force=False):
     global _cache
     now = time.time()
     if not force and _cache["data"] and (now - _cache["ts"]) < CACHE_TTL:
         return _cache["data"]
+    if _cache["loading"]:
+        return _cache["data"]
 
+    _cache["loading"] = True
     target = {
         "Unique Funnel":     "901324657489",
         "Migration Funnel":  "901002241743",
         "Activation Funnel": "901317185660",
         "Completed Orders":  "901002241760",
     }
-
     all_tasks = []
     for name, lid in target.items():
         print(f"[SYNC] Buscando {name}...")
@@ -226,19 +212,22 @@ def get_all_deals(force=False):
                 seen[tid] = t
 
     unique = list(seen.values())
-    print(f"[SYNC] Total final: {len(unique)} deals únicos")
-    _cache = {"data": unique, "ts": now}
+    print(f"[SYNC] Total: {len(unique)} deals")
+    _cache = {"data": unique, "ts": time.time(), "loading": False}
     return unique
 
+def get_all_deals(force=False):
+    return _do_sync(force=force)
+
 def apply_filters(deals, args):
-    executive  = args.get('executive')
-    status     = args.get('status')
-    region     = args.get('region')
-    source     = args.get('source')
-    list_name  = args.get('list')
-    date_from  = args.get('date_from')
-    date_to    = args.get('date_to')
-    date_field = args.get('date_field', 'created_at')
+    executive  = args.get("executive")
+    status     = args.get("status")
+    region     = args.get("region")
+    source     = args.get("source")
+    list_name  = args.get("list")
+    date_from  = args.get("date_from")
+    date_to    = args.get("date_to")
+    date_field = args.get("date_field", "created_at")
 
     if executive:  deals = [t for t in deals if t["executive"] == executive]
     if status:     deals = [t for t in deals if t["status"].lower() == status.lower()]
@@ -249,23 +238,7 @@ def apply_filters(deals, args):
     if date_to:    deals = [t for t in deals if t.get(date_field) and t[date_field] <= date_to]
     return deals
 
-@app.route('/')
-def index():
-    return send_from_directory('.', 'strm-dashboard.html')
-
-@app.route("/api/deals")
-def deals():
-    force     = request.args.get("sync") == "1"
-    all_tasks = get_all_deals(force=force)
-    result    = apply_filters(all_tasks, request.args)
-    return jsonify({"total": len(result), "deals": result})
-
-@app.route("/api/stats")
-def stats():
-    force     = request.args.get("sync") == "1"
-    all_tasks = get_all_deals(force=force)
-    deals     = apply_filters(all_tasks, request.args)
-
+def compute_stats(deals):
     total        = len(deals)
     signed       = [t for t in deals if t["is_signed"]]
     sqls         = [t for t in deals if t["is_sql"]]
@@ -303,7 +276,6 @@ def stats():
         if t["is_meeting"]: exec_stats[ex]["meetings"] += 1
         if t["advance"] and not t["is_signed"]: exec_stats[ex]["pipeline"] += t["advance"]
         if t["lead_time"] is not None: exec_stats[ex]["lead_times"].append(t["lead_time"])
-
     for ex in exec_stats:
         lt = exec_stats[ex]["lead_times"]
         exec_stats[ex]["avg_lead_time"] = round(sum(lt)/len(lt),1) if lt else None
@@ -319,7 +291,6 @@ def stats():
         if t["is_signed"]: source_stats[src]["signed"] += 1
         if t["is_sql"]:    source_stats[src]["sqls"]   += 1
         if t["advance"] and not t["is_signed"]: source_stats[src]["pipeline"] += t["advance"]
-
     for src in source_stats:
         l = source_stats[src]["leads"]
         source_stats[src]["close_rate"] = round(source_stats[src]["signed"]/l*100,1) if l else 0
@@ -336,7 +307,6 @@ def stats():
         if t["is_eligible"]: region_stats[r]["eligible"]  += 1
         if t["advance"] and not t["is_signed"]: region_stats[r]["pipeline"] += t["advance"]
         if t["lead_time"] is not None: region_stats[r]["lead_times"].append(t["lead_time"])
-
     for r in region_stats:
         lt = region_stats[r]["lead_times"]
         region_stats[r]["avg_lead_time"] = round(sum(lt)/len(lt),1) if lt else None
@@ -351,11 +321,11 @@ def stats():
         if month not in monthly:
             monthly[month] = {"leads":0,"signed":0,"sqls":0,"meetings":0}
         monthly[month]["leads"] += 1
-        if t["is_signed"]:  monthly[month]["signed"]   += 1
-        if t["is_sql"]:     monthly[month]["sqls"]     += 1
-        if t["is_meeting"]: monthly[month]["meetings"]  += 1
+        if t["is_signed"]:  monthly[month]["signed"]  += 1
+        if t["is_sql"]:     monthly[month]["sqls"]    += 1
+        if t["is_meeting"]: monthly[month]["meetings"] += 1
 
-    return jsonify({
+    return {
         "summary": {
             "total_deals":      total,
             "signed":           len(signed),
@@ -386,12 +356,40 @@ def stats():
         "by_source":    source_stats,
         "by_region":    region_stats,
         "monthly":      dict(sorted(monthly.items())),
+    }
+
+# ── ROUTES ────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return send_from_directory(".", "strm-dashboard.html")
+
+@app.route("/api/ready")
+def ready():
+    return jsonify({
+        "ready":   _cache["data"] is not None,
+        "loading": _cache["loading"],
+        "total":   len(_cache["data"]) if _cache["data"] else 0,
     })
+
+@app.route("/api/deals")
+def deals():
+    if not _cache["data"]:
+        return jsonify({"total": 0, "deals": [], "loading": True})
+    result = apply_filters(_cache["data"], request.args)
+    return jsonify({"total": len(result), "deals": result, "loading": False})
+
+@app.route("/api/stats")
+def stats():
+    if not _cache["data"]:
+        return jsonify({"loading": True})
+    deals = apply_filters(_cache["data"], request.args)
+    return jsonify({**compute_stats(deals), "loading": False})
 
 @app.route("/api/sync")
 def sync():
-    get_all_deals(force=True)
-    return jsonify({"ok": True})
+    threading.Thread(target=lambda: _do_sync(force=True), daemon=True).start()
+    return jsonify({"ok": True, "message": "Sync iniciado em background"})
 
 @app.route("/api/filters")
 def filters():
@@ -402,87 +400,76 @@ def filters():
         "sources":    ["Meta ads","Smart list","Outreach/Network","Marketing",
                        "Clients referral","Partner referral","Website contact",
                        "Social media","Unknown","Others"],
-        "statuses":   ["new lead","new verified lead","meeting","realized meeting",
-                       "negotiation","signed","lost","day 1","day 2","day 3"],
         "regions":    ["BR","US","ROW"],
         "lists":      ["Unique Funnel","Migration Funnel","Activation Funnel","Completed Orders"],
     })
 
-# ─── GROWTH ───────────────────────────────────────────────
+# ── GROWTH ────────────────────────────────────────────────
 
 @app.route("/api/upload-growth", methods=["POST"])
 def upload_growth():
-    if 'file' not in request.files:
+    if "file" not in request.files:
         return jsonify({"error": "Nenhum arquivo enviado"}), 400
-    file = request.files['file']
-    if not file.filename.endswith(('.xlsx', '.xls')):
+    file = request.files["file"]
+    if not file.filename.endswith((".xlsx", ".xls")):
         return jsonify({"error": "Formato inválido. Use .xlsx"}), 400
 
     df = pd.read_excel(io.BytesIO(file.read()))
 
     def parse_stage(val):
-        if pd.isna(val) or str(val).strip() in ['-', ' - ', '']:
+        if pd.isna(val) or str(val).strip() in ["-", " - ", ""]:
             return 1
         try:
-            return int(str(val).split('-')[0].strip())
+            return int(str(val).split("-")[0].strip())
         except:
             return 1
 
     def parse_region(pais, regiao):
-        if pd.isna(pais) or str(pais).strip() == '':
-            return 'BR'
+        if pd.isna(pais) or str(pais).strip() == "":
+            return "BR"
         p = str(pais).strip().upper()
-        if p in ('BR', 'BRAZIL', 'BRASIL'):
-            return 'BR'
-        if p in ('US', 'USA', 'UNITED STATES'):
-            return 'US'
-        return 'ROW'
+        if p in ("BR", "BRAZIL", "BRASIL"): return "BR"
+        if p in ("US", "USA", "UNITED STATES"): return "US"
+        return "ROW"
 
     new_records = []
     for _, row in df.iterrows():
-        stage       = parse_stage(row.get('Estagio_Numerico'))
-        region      = parse_region(row.get('Pais'), row.get('Regiao'))
-        is_eligible = stage >= 3 if region == 'US' else stage >= 4
-        email       = str(row.get('E-mail', '') or '').lower().strip()
-
+        stage       = parse_stage(row.get("Estagio_Numerico"))
+        region      = parse_region(row.get("Pais"), row.get("Regiao"))
+        is_eligible = stage >= 3 if region == "US" else stage >= 4
+        email       = str(row.get("E-mail", "") or "").lower().strip()
         new_records.append({
-            "nome":         str(row.get('Nome', '') or ''),
+            "nome":         str(row.get("Nome", "") or ""),
             "email":        email,
             "regiao":       region,
-            "pais":         str(row.get('Pais', '') or 'BR'),
+            "pais":         str(row.get("Pais", "") or "BR"),
             "estagio":      stage,
-            "genero":       str(row.get('Genero', '') or ''),
-            "verificado":   str(row.get('Verificado', '') or '') == 'Sim',
-            "advance":      float(row.get('Valor do advance', 0) or 0),
-            "data_cadastro":str(row.get('Data_Cadastro', '') or '')[:10],
-            "month":        int(row.get('month', 0) or 0),
-            "year":         int(row.get('year', 0) or 0),
+            "genero":       str(row.get("Genero", "") or ""),
+            "verificado":   str(row.get("Verificado", "") or "") == "Sim",
+            "advance":      float(row.get("Valor do advance", 0) or 0),
+            "data_cadastro":str(row.get("Data_Cadastro", "") or "")[:10],
+            "month":        int(row.get("month", 0) or 0),
+            "year":         int(row.get("year", 0) or 0),
             "is_eligible":  is_eligible,
         })
 
-    # Merge com existentes, deduplicando por email
     existing = _growth_cache.get("data") or []
     existing_emails = {r["email"] for r in existing if r["email"]}
-
     added = 0
     for r in new_records:
         if r["email"] and r["email"] in existing_emails:
             continue
         existing.append(r)
-        if r["email"]:
-            existing_emails.add(r["email"])
+        if r["email"]: existing_emails.add(r["email"])
         added += 1
-
-    # Sem email sempre entra
     sem_email = [r for r in new_records if not r["email"]]
     existing.extend(sem_email)
-
     _growth_cache["data"] = existing
 
     return jsonify({
-        "ok":                 True,
-        "total":              len(existing),
-        "added":              added,
+        "ok":    True,
+        "total": len(existing),
+        "added": added,
         "duplicates_skipped": len(new_records) - added - len(sem_email),
     })
 
@@ -503,8 +490,7 @@ def growth_stats():
         if reg not in by_region:
             by_region[reg] = {"total": 0, "elegiveis": 0}
         by_region[reg]["total"] += 1
-        if r["is_eligible"]:
-            by_region[reg]["elegiveis"] += 1
+        if r["is_eligible"]: by_region[reg]["elegiveis"] += 1
 
     by_stage = {}
     for r in records:
@@ -529,8 +515,8 @@ def growth_stats():
             "elegiveis":      len(elegiveis),
             "verificados":    len(verificados),
             "com_advance":    len(com_advance),
-            "elegivel_pct":   round(len(elegiveis)/total*100, 1) if total else 0,
-            "verificado_pct": round(len(verificados)/total*100, 1) if total else 0,
+            "elegivel_pct":   round(len(elegiveis)/total*100,1) if total else 0,
+            "verificado_pct": round(len(verificados)/total*100,1) if total else 0,
         },
         "by_region": by_region,
         "by_stage":  dict(sorted(by_stage.items())),
@@ -544,16 +530,17 @@ def clear_growth():
     _growth_cache["data"] = []
     return jsonify({"ok": True})
 
-# ─── PRELOAD ──────────────────────────────────────────────
+# ── PRELOAD ───────────────────────────────────────────────
 
 def preload():
     time.sleep(2)
-    print("[PRELOAD] Iniciando busca de dados...")
+    print("[PRELOAD] Iniciando...")
     try:
-        get_all_deals(force=True)
-        print("[PRELOAD] Dados carregados no cache.")
+        _do_sync(force=True)
+        print("[PRELOAD] Pronto.")
     except Exception as e:
         print(f"[PRELOAD] Erro: {e}")
+        _cache["loading"] = False
 
 threading.Thread(target=preload, daemon=True).start()
 
