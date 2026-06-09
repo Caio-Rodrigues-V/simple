@@ -1,5 +1,6 @@
-# requirements.txt
 flask
 flask-cors
 requests
 gunicorn
+pandas
+openpyxl
